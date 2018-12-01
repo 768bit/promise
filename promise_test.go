@@ -34,9 +34,9 @@ func TestPromise_Then(t *testing.T) {
 			return nil
 		})
 
-	promise.Catch(func(error error) error {
+	promise.Catch(func(err error) (interface{}, error) {
 		t.Fatal("CATCH TRIGGERED IN .THEN TEST")
-		return nil
+		return nil, nil
 	})
 
 	promise.Await()
@@ -48,19 +48,19 @@ func TestPromise_Catch(t *testing.T) {
 	})
 
 	promise.
-		Catch(func(error error) error {
-			if error.Error() == "very serious error" {
-				return errors.New("dealing with error at this stage")
+		Catch(func(err error) (interface{}, error) {
+			if err.Error() == "very serious error" {
+				return nil, errors.New("dealing with error at this stage")
 			}
-			return nil
+			return nil, nil
 		}).
-		Catch(func(error error) error {
-			if error.Error() != "dealing with error at this stage" {
+		Catch(func(err error) (interface{}, error) {
+			if err.Error() != "dealing with error at this stage" {
 				t.Fatal("ERROR DOES NOT PROPAGATE")
 			} else {
-				log.Println(error.Error())
+				log.Println(err.Error())
 			}
-			return nil
+			return nil, nil
 		})
 
 	promise.Then(func(data interface{}) interface{} {
@@ -81,9 +81,9 @@ func TestPromise_Panic(t *testing.T) {
 			t.Fatal("THEN TRIGGERED")
 			return nil
 		}).
-		Catch(func(error error) error {
-			log.Println("Panic Recovered:", error.Error())
-			return nil
+		Catch(func(err error) (interface{}, error) {
+			log.Println("Panic Recovered:", err.Error())
+			return nil, nil
 		})
 
 	promise.Await()
@@ -115,4 +115,96 @@ func TestPromise_Await(t *testing.T) {
 			return nil
 		})
 	}
+}
+
+func TestPromise_Map(t *testing.T) {
+	var items = []interface{}{"hello", "world"}
+
+	promise := Map(items, func(item interface{}) (interface{}, error) {
+		//log.Println(item)
+		return item.(string) + "_FROM_B", nil
+	})
+
+	v, err := promise.Yield()
+	println(v, err)
+}
+
+func TestPromise_MapWithPromises(t *testing.T) {
+	var items = []interface{}{"hello", New(func(resolve func(interface{}), reject func(error)) {
+		resolve("Boom")
+	})}
+
+	promise := Map(items, func(item interface{}) (interface{}, error) {
+		//log.Println(item)
+		return item.(string) + "_FROM_B", nil
+	})
+
+	v, err := promise.Yield()
+	println(v, err)
+}
+
+func TestPromise_Spread(t *testing.T) {
+	var items = []interface{}{"hello", New(func(resolve func(interface{}), reject func(error)) {
+		resolve("Boom")
+	})}
+
+	promise := Map(items, func(item interface{}) (interface{}, error) {
+		//log.Println(item)
+		return item.(string) + "_FROM_B", nil
+	})
+
+	promise.Spread(func(vals ...interface{}) interface{} {
+		return vals[0].(string) + " -> " + vals[1].(string)
+	})
+
+	v, err := promise.Yield()
+	println(v.(string), err)
+}
+
+func TestPromise_ChildPromises(t *testing.T) {
+	promise := New(func(resolve func(interface{}), reject func(error)) {
+
+		resolve("Outer Promise Resolved")
+
+	}).Then(func(data interface{}) interface{} {
+		return New(func(resolve func(interface{}), reject func(error)) {
+			resolve("Inner Promise Resolved:" + data.(string))
+		})
+	})
+
+	v, err := promise.Yield()
+	println(v.(string), err)
+}
+
+func TestPromise_ChildPromiseFailed(t *testing.T) {
+	promise := New(func(resolve func(interface{}), reject func(error)) {
+
+		resolve("Outer Promise Resolved")
+
+	}).Then(func(data interface{}) interface{} {
+		println("Got Resolved", data.(string))
+		return New(func(resolve func(interface{}), reject func(error)) {
+			reject(errors.New("Inner Promise Rejected:" + data.(string)))
+		})
+	})
+
+	v, err := promise.Yield()
+	println(v.(string), err.Error())
+}
+
+func TestPromise_Prop(t *testing.T) {
+	var items = map[string]interface{}{
+		"aa": "boom1",
+		"bb": New(func(resolve func(interface{}), reject func(error)) {
+			resolve("boom2")
+		}),
+	}
+
+	promise := Props(items, func(item interface{}) (interface{}, error) {
+		//log.Println(item)
+		return item.(string) + "_FROM_B", nil
+	})
+
+	v, err := promise.Yield()
+	log.Println(v, err)
 }

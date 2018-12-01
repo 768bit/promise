@@ -2,6 +2,7 @@ package promise
 
 import (
 	"errors"
+	"reflect"
 	"sync"
 )
 
@@ -33,15 +34,21 @@ type Promise struct {
 	// asynchronous work, and then, once that completes, either calls the
 	// resolve function to resolve the promise or else rejects it if
 	// an error or panic occurred.
-	executor func(resolve func(interface{}), reject func(error))
+	executor     func(resolve func(interface{}), reject func(error))
+	iterExecutor func(wg *sync.WaitGroup, iterPromise *Promise, resolve func(interface{}), reject func(error))
+	isIterable   bool
 
 	// Appends fulfillment to the promise,
 	// and returns a new promise.
-	then []func(data interface{}) interface{}
+	then     []func(data interface{}) interface{}
+	thenDone int
 
 	// Appends a rejection handler to the promise,
 	// and returns a new promise.
-	catch []func(error error) error
+	catch   []func(error error) (interface{}, error)
+	finally []func()
+
+	errorHandled bool
 
 	// Stores the result passed to resolve()
 	result interface{}
@@ -54,20 +61,57 @@ type Promise struct {
 
 	// WaitGroup allows to block until all callbacks are executed.
 	wg *sync.WaitGroup
+
+	// Iteration WaitGroup allows to block until all iterables have been processed before proceeding.
+	iterWg *sync.WaitGroup
+}
+
+// New instantiates and returns a *Promise object.
+func newIterPromise(iterSize int, iterExecutor func(wg *sync.WaitGroup, iterPromise *Promise, resolve func(interface{}), reject func(error))) *Promise {
+	var promise = &Promise{
+		state:        pending,
+		iterExecutor: iterExecutor,
+		then:         make([]func(interface{}) interface{}, 0),
+		thenDone:     0,
+		catch:        make([]func(error) (interface{}, error), 0),
+		errorHandled: false,
+		finally:      make([]func(), 0),
+		result:       nil,
+		error:        nil,
+		mutex:        &sync.Mutex{},
+		wg:           &sync.WaitGroup{},
+		iterWg:       &sync.WaitGroup{},
+		isIterable:   true,
+	}
+
+	promise.wg.Add(1)
+	promise.iterWg.Add(iterSize)
+
+	go func() {
+		defer promise.handlePanic()
+		promise.iterExecutor(promise.iterWg, promise, promise.resolve, promise.reject)
+	}()
+
+	return promise
 }
 
 // New instantiates and returns a *Promise object.
 func New(executor func(resolve func(interface{}), reject func(error))) *Promise {
 	var promise = &Promise{
-		state:    pending,
-		executor: executor,
-		then:     make([]func(interface{}) interface{}, 0),
-		catch:    make([]func(error) error, 0),
-		result:   nil,
-		error:    nil,
-		mutex:    &sync.Mutex{},
-		wg:       &sync.WaitGroup{},
+		state:        pending,
+		executor:     executor,
+		then:         make([]func(interface{}) interface{}, 0),
+		thenDone:     0,
+		catch:        make([]func(error) (interface{}, error), 0),
+		errorHandled: false,
+		finally:      make([]func(), 0),
+		result:       nil,
+		error:        nil,
+		mutex:        &sync.Mutex{},
+		wg:           &sync.WaitGroup{},
 	}
+
+	promise.wg.Add(1)
 
 	go func() {
 		defer promise.handlePanic()
@@ -78,28 +122,50 @@ func New(executor func(resolve func(interface{}), reject func(error))) *Promise 
 }
 
 func (promise *Promise) resolve(resolution interface{}) {
-	promise.mutex.Lock()
-	defer promise.mutex.Unlock()
 
 	if promise.state != pending {
 		return
 	}
+
+	promise.mutex.Lock()
+
+	promise.result = resolution
+
+	if promise.thenDone >= 0 && promise.thenDone < len(promise.then) {
+
+		for _, value := range promise.then[promise.thenDone:] {
+			r, err := promise.checkReturnedFulfilmentValue(value(promise.result))
+			if err != nil {
+				promise.mutex.Unlock()
+				promise.reject(err)
+				return
+			}
+			promise.thenDone++
+			promise.result = r
+			promise.wg.Done()
+			if promise.state == rejected {
+				promise.mutex.Unlock()
+				return
+			}
+		}
+
+	}
+	defer promise.mutex.Unlock()
 
 	for range promise.catch {
 		promise.wg.Done()
 	}
 
-	promise.result = resolution
-
-	for _, value := range promise.then {
-		promise.result = value(promise.result)
-		promise.wg.Done()
-	}
-
 	promise.state = fulfilled
+
+	promise.runFinally()
+
+	promise.wg.Done()
+
 }
 
 func (promise *Promise) reject(error error) {
+
 	promise.mutex.Lock()
 	defer promise.mutex.Unlock()
 
@@ -107,24 +173,56 @@ func (promise *Promise) reject(error error) {
 		return
 	}
 
+	promise.state = rejected
+
+	expectThen := len(promise.then)
+
 	for range promise.then {
+		if expectThen-promise.thenDone <= 0 {
+			break
+		}
 		promise.wg.Done()
+		promise.thenDone++
 	}
 
 	promise.error = error
 
-	for _, value := range promise.catch {
-		promise.error = value(promise.error)
+	for i, value := range promise.catch {
+		v, err, _ := promise.checkReturnedRejectionValue(value(promise.error))
+		if err == nil && v != nil {
+			promise.error = err
+			promise.errorHandled = true
+			promise.result = v
+			if i < len(promise.catch)-1 {
+				for range promise.catch[i:] {
+					promise.wg.Done()
+				}
+			}
+			break
+		} else if !promise.errorHandled {
+			promise.error = err
+		}
 		promise.wg.Done()
 	}
 
-	promise.state = rejected
+	promise.runFinally()
+
+	promise.wg.Done()
+
 }
 
 func (promise *Promise) handlePanic() {
 	var r = recover()
 	if r != nil {
 		promise.reject(errors.New(r.(string)))
+	}
+}
+
+func (promise *Promise) runFinally() {
+
+	for _, value := range promise.finally {
+		value()
+		promise.wg.Done()
 	}
 }
 
@@ -144,7 +242,7 @@ func (promise *Promise) Then(fulfillment func(data interface{}) interface{}) *Pr
 }
 
 // Catch appends a rejection handler callback to the promise, and returns a new promise.
-func (promise *Promise) Catch(rejection func(error error) error) *Promise {
+func (promise *Promise) Catch(rejection func(error error) (interface{}, error)) *Promise {
 	promise.mutex.Lock()
 	defer promise.mutex.Unlock()
 
@@ -152,14 +250,131 @@ func (promise *Promise) Catch(rejection func(error error) error) *Promise {
 		promise.wg.Add(1)
 		promise.catch = append(promise.catch, rejection)
 	} else if promise.state == rejected {
-		promise.error = rejection(promise.error)
+		if promise.errorHandled {
+			return promise
+		}
+		v, err, _ := promise.checkReturnedRejectionValue(rejection(promise.error))
+		if err == nil && v != nil {
+			promise.error = err
+			promise.errorHandled = true
+			promise.result = v
+			return promise
+		} else if !promise.errorHandled {
+			promise.error = err
+		}
 	}
 
 	return promise
 }
 
+// Spread is like then but if the result is a slice the values are spread out into the thenable function...
+func (promise *Promise) Spread(spreadFn func(vals ...interface{}) interface{}) *Promise {
+	return promise.Then(func(data interface{}) interface{} {
+		if reflect.TypeOf(data).Kind() != reflect.Slice {
+			return spreadFn(data)
+		} else {
+			odata := data.([]interface{})
+			return spreadFn(odata...)
+		}
+	})
+}
+
+// Each will take an iterable result from a thenable and iterate the results and run the eachFn on the item
+func (promise *Promise) Each(eachFn PromiseIteratorFunc) *Promise {
+	return promise.Then(func(data interface{}) interface{} {
+		if reflect.TypeOf(data).Kind() != reflect.Slice {
+			_, err := iteratorEstablishFunc(data, eachFn)
+			if err != nil {
+				promise.reject(err)
+				return nil
+			}
+			return nil
+		} else {
+			odata := data.([]interface{})
+			p := Each(odata, eachFn)
+			_, err := p.Yield()
+			if err != nil {
+				promise.reject(err)
+				return nil
+			}
+			return nil
+		}
+	})
+}
+
+// Map will take an iterable result from a thenable and Map it to an array in parallel (like each but actually returns stuff)
+func (promise *Promise) Map(mapFn PromiseIteratorFunc) *Promise {
+	return promise.Then(func(data interface{}) interface{} {
+		if reflect.TypeOf(data).Kind() != reflect.Slice {
+			v, err := iteratorEstablishFunc(data, mapFn)
+			if err != nil {
+				promise.reject(err)
+				return nil
+			}
+			return v
+		} else {
+			odata := data.([]interface{})
+			p := Map(odata, mapFn)
+			v, err := p.Yield()
+			if err != nil {
+				promise.reject(err)
+				return nil
+			}
+			return v
+		}
+	})
+}
+
+// MapSeries will take an iterable result from a thenable and Map it to an array in series (like each but actually returns stuff)
+func (promise *Promise) MapSeries(mapFn PromiseIteratorFunc) *Promise {
+	return promise.Then(func(data interface{}) interface{} {
+		if reflect.TypeOf(data).Kind() != reflect.Slice {
+			v, err := iteratorEstablishFunc(data, mapFn)
+			if err != nil {
+				promise.reject(err)
+				return nil
+			}
+			return v
+		} else {
+			odata := data.([]interface{})
+			p := MapSeries(odata, mapFn)
+			v, err := p.Yield()
+			if err != nil {
+				promise.reject(err)
+				return nil
+			}
+			return v
+		}
+	})
+}
+
+// Catch appends a rejection handler callback to the promise, and returns a new promise.
+func (promise *Promise) Finally(finallyFunc func()) *Promise {
+	promise.mutex.Lock()
+	defer promise.mutex.Unlock()
+
+	if promise.state == pending {
+		promise.wg.Add(1)
+		promise.finally = append(promise.finally, finallyFunc)
+	} else if promise.state != pending {
+		finallyFunc()
+	}
+
+	return promise
+}
+
+// Yield will await for a resolution or rejection via Await and Yield the result...
+func (promise *Promise) Yield() (interface{}, error) {
+	promise.Await()
+	//get the values and return
+	return promise.result, promise.error
+}
+
 // Await is a blocking function that waits for all callbacks to be executed.
 func (promise *Promise) Await() {
+	if promise.isIterable {
+		promise.iterWg.Wait()
+	}
 	promise.wg.Wait()
 }
 
